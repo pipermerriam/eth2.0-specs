@@ -12,7 +12,7 @@ This is a **work in progress** describing typing, serialization and Merkleizatio
 - [Serialization](#serialization)
     - [`"uintN"`](#uintn)
     - [`"bool"`](#bool)
-    - [Tuples, containers, lists](#tuples-containers-lists)
+    - [Vectors, containers, lists](#vectors-containers-lists)
 - [Deserialization](#deserialization)
 - [Merkleization](#merkleization)
 - [Self-signed containers](#self-signed-containers)
@@ -34,11 +34,13 @@ This is a **work in progress** describing typing, serialization and Merkleizatio
 ### Composite types
 
 * **container**: ordered heterogenous collection of values
-    * key-pair curly bracket notation `{}`, e.g. `{'foo': "uint64", 'bar': "bool"}`
-* **tuple**: ordered fixed-length homogeneous collection of values
+    * key-pair curly bracket notation `{}`, e.g. `{"foo": "uint64", "bar": "bool"}`
+* **vector**: ordered fixed-length homogeneous collection of values
     * angle bracket notation `[type, N]`, e.g. `["uint64", N]`
 * **list**: ordered variable-length homogenous collection of values
     * angle bracket notation `[type]`, e.g. `["uint64"]`
+
+We recursively define "variable-size" types to be lists and all types that contains a variable-size type. All other types are said to be "fixed-size".
 
 ### Aliases
 
@@ -52,37 +54,84 @@ For convenience we alias:
 
 We recursively define the `serialize` function which consumes an object `value` (of the type specified) and returns a bytestring of type `"bytes"`.
 
-*Note*: In the function definitions below (`serialize`, `hash_tree_root`, `signed_root`, etc.) objects implicitly carry their type.
+> *Note*: In the function definitions below (`serialize`, `hash_tree_root`, `signed_root`, `is_fixed_size`, `is_variable_size` etc.) objects implicitly carry their type.
 
-### `uintN`
+The serialized representation of an object **MUST** be less than `2**32` bytes long.
+
+### `"uintN"`
+
+A byte string of width  `N // 8` containing the little-endian encode integer.
 
 ```python
 assert N in [8, 16, 32, 64, 128, 256]
-return value.to_bytes(N // 8, 'little')
+return value.to_bytes(N // 8, "little")
 ```
 
-### `bool`
+### `"bool"`
+
+* The byte `\x00` **if** the value is `False`
+* The byte `\x01` **if** the value is `True`
 
 ```python
 assert value in (True, False)
-return b'\x01' if value is True else b'\x00'
+return b"\x01" if value is True else b"\x00"
 ```
 
-### Tuples, containers, lists
+### Vectors, containers, lists
 
-If `value` is fixed-length (i.e. does not embed a list):
+The serialized representation of composite types is comprised of two binary sections.
+
+* The first section is the concatenation of a mixture of either the serialized representation for *fixed size* elements **or** a serialized offset value for *variable size* elements.
+    - All *fixed size* elements are represented in this section as their serialized representation.
+    - All *variable size* elements are represented in this section with a `"uint32"` serialized offset where the serialized representation of the element is located in the second section.
+        - offsets are relative to the beginning of the beginning of the entire serialized representation (the start of the first section)
+* The second section is the concatenation of the serialized representations of **only** the *variable size* types.
+    - This section is empty in the case of a purely *fixed size* type.
+
+
+Offset values are subject to the following validity rules:
+
+- For Vector and Container types:
+    - The first offset **must** be equal to the length of the first section.
+- For all types:
+    - Offsets **MAY NOT** be less than any previous offset.
+    - Offsets **MUST** be less than `2**32`
+
+
+Below is an illustrative implementation of the `serialize` function for vector, container and lists types.
 
 ```python
-return ''.join([serialize(element) for element in value])
-```
+# The second section is the concatenation of the serialized variable-size elements
+section_2_parts = [
+    serialize(element) if is_variable_size(element)
+    else ''
+    for element in value
+]
+section_2_lengths = [len(part) for part in section_2_parts]
 
-If `value` is variable-length (i.e. embeds a list):
+# Compute the length of the first section (can also be extracted from the type directly)
+section_1_length = sum(
+    len(serialize(element)) if is_fixed_size(element)
+    else 4
+    for element in value
+)
 
-```python
-serialized_bytes = ''.join([serialize(element) for element in value])
-assert len(serialized_bytes) < 2**(8 * BYTES_PER_LENGTH_PREFIX)
-serialized_length = len(serialized_bytes).to_bytes(BYTES_PER_LENGTH_PREFIX, 'little')
-return serialized_length + serialized_bytes
+# Compute the offset values for each part of the second section
+section_1_offsets = [
+    section_1_length + sum(section_2_lengths[:element_index]) if is_variable_size(element)
+    else None
+    for element_index, element in enumerate(value)
+]
+assert all(offset is None or offset < 2**32 for offset in section_1_offsets)
+
+# The first section is the concatenation of the serialized fixed-size elements and offsets
+section_1_parts = [
+    serialize(element) if is_fixed_size(element)
+    else serialize(section_1_offsets[element_index])
+    for element_index, element in enumerate(value)
+]
+
+return ''.join(section_1_parts + section_2_parts)
 ```
 
 ## Deserialization
@@ -99,9 +148,9 @@ We first define helper functions:
 
 We now define Merkleization `hash_tree_root(value)` of an object `value` recursively:
 
-* `merkleize(pack(value))` if `value` is a basic object or a tuple of basic objects
+* `merkleize(pack(value))` if `value` is a basic object or a vector of basic objects
 * `mix_in_length(merkleize(pack(value)), len(value))` if `value` is a list of basic objects
-* `merkleize([hash_tree_root(element) for element in value])` if `value` is a tuple of composite objects or a container
+* `merkleize([hash_tree_root(element) for element in value])` if `value` is a vector of composite objects or a container
 * `mix_in_length(merkleize([hash_tree_root(element) for element in value]), len(value))` if `value` is a list of composite objects
 
 ## Self-signed containers
